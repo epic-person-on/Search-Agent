@@ -1,45 +1,60 @@
-import streamlit as st
+import chainlit as cl
 from langchain_groq import ChatGroq
 from langchain_community.utilities import ArxivAPIWrapper, WikipediaAPIWrapper
 from langchain_community.tools import ArxivQueryRun, WikipediaQueryRun
+from langchain_community.utilities import SearxSearchWrapper
+from langchain_community.tools.searx_search.tool import SearxSearchResults
 from langchain.agents import initialize_agent, AgentType
-from langchain_community.callbacks.streamlit import StreamlitCallbackHandler  # Updated import
-import os
 from dotenv import load_dotenv
+import os
 
-load_dotenv() 
-api_key = os.getenv("GROQ_API_KEY") 
-## Arxiv and wikipedia Tools
+load_dotenv()
+api_key = os.getenv("GROQ_API_KEY")
+
+# Arxiv, Wikipedia, and Searxng Tools
 arxiv_wrapper = ArxivAPIWrapper(top_k_results=1, doc_content_chars_max=200)
 arxiv = ArxivQueryRun(api_wrapper=arxiv_wrapper)
 
 api_wrapper = WikipediaAPIWrapper(top_k_results=1, doc_content_chars_max=200)
 wiki = WikipediaQueryRun(api_wrapper=api_wrapper)
 
-st.title("🔎Search Web with Llama 3.3")
+searxng_wrapper = SearxSearchWrapper(searx_host="http://localhost:8080")
+google = SearxSearchResults(name="Google", wrapper=searxng_wrapper, kwargs={"engines": ["google"]})
+gitlab = SearxSearchResults(name="Gitlab", wrapper=searxng_wrapper, kwargs={"engines": ["gitlab"]})
 
-if "messages" not in st.session_state:
-    st.session_state["messages"] = [
-        {"role": "assistant", "content": "Hi, I can search the web. How can I help you?"}
-    ]
 
-for msg in st.session_state.messages:
-    st.chat_message(msg["role"]).write(msg['content'])
+# Initialize language model and tools outside the user input block
+llm = ChatGroq(groq_api_key=api_key, model_name="llama-3.3-70b-specdec", streaming=True)
+tools = [arxiv, wiki, google, gitlab]
 
-if prompt := st.chat_input(placeholder="Enter Your Question Here"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    st.chat_message("user").write(prompt)
+# Initialize agent
+search_agent = initialize_agent(
+    tools, llm, agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION, handle_parsing_errors=True
+)
 
-    llm = ChatGroq(groq_api_key=api_key, model_name="llama-3.3-70b-versatile", streaming=True)
-    tools = [arxiv, wiki]
+# Setup callback handler
+@cl.on_chat_start
+def setup_agent():
+    # Store the agent in the user session for later use
+    cl.user_session.set("search_agent", search_agent)
 
-    search_agent = initialize_agent(tools, llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, handle_parsing_errors=True)
 
-    with st.chat_message("assistant"):
-        st_cb = StreamlitCallbackHandler(st.container(), expand_new_thoughts=False)
-        try:
-            response = search_agent.run([{"role": "user", "content": prompt}], callbacks=[st_cb])
-            st.session_state.messages.append({'role': 'assistant', "content": response})
-            st.write(response)
-        except ValueError as e:
-            st.error(f"An error occurred: {e}")
+@cl.on_message
+async def handle_message(message: cl.Message):
+    user_input = message.content.lower()
+
+    # Retrieve the agent from user session
+    search_agent = cl.user_session.get("search_agent")
+
+    # Process the message with LangChain's agent
+    try:
+        # Get the agent's response
+        response = search_agent.run([{"role": "user", "content": user_input}])
+        
+        # Send the response to Chainlit chat interface
+        await cl.Message(content=response).send()
+
+    except ValueError as e:
+        await cl.Message(content=f"An error occurred: {e}").send()
+    except Exception as e:
+        await cl.Message(content=f"Unexpected error occurred: {e}").send
